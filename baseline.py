@@ -53,6 +53,9 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
+        # ensure LoRA params are on the same device as input
+        self.lora_A.to(x.device)
+        self.lora_B.to(x.device)
         lora_out = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
         return base_out + lora_out
 
@@ -1394,13 +1397,16 @@ def main():
         use_confidence_gate=cfg.use_confidence_gate,
         use_token_quality=cfg.use_token_quality,
         use_token_patch_cross=cfg.use_token_patch_cross
-    ).to(cfg.device)
+    )
     opt = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     # 结构：可选注入LoRA（在调度与训练前）
     if cfg.use_lora:
         apply_lora_to_clip(model.clip, rank=cfg.lora_rank, alpha=cfg.lora_alpha, dropout=cfg.lora_dropout)
         print(f"  🔧 Injected LoRA into CLIP (rank={cfg.lora_rank}, alpha={cfg.lora_alpha}, dropout={cfg.lora_dropout})")
+
+    # IMPORTANT: Move model to device AFTER any module injections (e.g., LoRA)
+    model = model.to(cfg.device)
 
     # 学习率调度器（支持多种策略），步数需考虑梯度累积
     updates_per_epoch = math.ceil(len(train_dl) / max(1, cfg.grad_accum_steps))
