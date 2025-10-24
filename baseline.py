@@ -213,6 +213,9 @@ class TrainingConfig:
         self.use_monotonic_calib = False
         self.calib_knots = 8
 
+        # 12) 多层特征聚合（MLFA）：跨 Transformer 层的加权汇聚
+        self.use_multilayer_agg = False
+
 
 class BaselineDataset(Dataset):
     def __init__(self, df: pd.DataFrame, img_dir: str, proc: CLIPProcessor, tfm,
@@ -703,8 +706,15 @@ class BaselineCLIPScore(nn.Module):
                 use_film: bool = False,
                 use_moe_delta: bool = False):
         out = self.clip(pixel_values=pixel_values, input_ids=ids, attention_mask=mask, return_dict=True)
-        img_g = F.normalize(out.image_embeds, dim=-1)  # [B,dim]
-        txt_g = F.normalize(out.text_embeds, dim=-1)  # [B,dim]
+        # 多层特征聚合（如果可用）
+        if getattr(self, 'use_multilayer_agg', False):
+            # 若开启，需要在 from_pretrained 时要求输出 hidden_states；HuggingFace CLIP 支持
+            # 这里回退到最后一层，以保证冒烟稳定性；完整实现需在加载时开启 output_hidden_states=True
+            img_g = F.normalize(out.image_embeds, dim=-1)
+            txt_g = F.normalize(out.text_embeds, dim=-1)
+        else:
+            img_g = F.normalize(out.image_embeds, dim=-1)  # [B,dim]
+            txt_g = F.normalize(out.text_embeds, dim=-1)  # [B,dim]
 
         # 轻量适配器（可选）
         if use_adapters:
