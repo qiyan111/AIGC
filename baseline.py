@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """baseline_clip_eval.py
-Minimal AIGC image scorer that relies *only* on CLIP global embeddings.
-No quality gate, no cross-modal transformer, no alignment or distribution losses.
-Useful as a clean baseline to compare against more complex architectures.
+Minimal AIGC image scorer with CLIP global embeddings.
+Now enhanced with: AMP mixed precision, gradient accumulation, early stopping,
+deterministic seeds, flexible DataLoader settings, scheduler selection, resume,
+and CSV logging, while keeping residual-learning as the default.
 """
 
 import argparse
 import math
 import os
+import random
 from typing import Tuple
 
 import torch
@@ -18,18 +20,30 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
 import pandas as pd
-from transformers import CLIPModel, CLIPProcessor, get_cosine_schedule_with_warmup
+from transformers import (
+    CLIPModel,
+    CLIPProcessor,
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+    get_constant_schedule_with_warmup,
+)
 from sklearn.model_selection import train_test_split
 from scipy.stats import spearmanr, pearsonr
+import numpy as np
+from datetime import datetime
+import csv
 
 
 class TrainingConfig:
     """Hyper-parameters with sensible defaults. Can be overridden via CLI."""
 
     def __init__(self):
-        self.data_csv_path = "/home/zry00006639/AIGC/消融实验/AQIQA-3k.data.csv/data.csv"  # update to your csv
-        self.image_base_dir = "/home/zry00006639/AIGC/消融实验/ACGIQA-3K"  # update to your images
-        self.clip_model_name = "/home/zry00006639/AIGC/clip-vit-large-patch14"
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        # Default to repository-local data; users can override via CLI
+        self.data_csv_path = os.path.join(repo_root, "data", "data.csv")
+        self.image_base_dir = os.path.join(repo_root, "data", "ACGIQA-3K")
+        # Default to HF Hub model name; users can pass a local path instead
+        self.clip_model_name = os.environ.get("CLIP_MODEL_NAME", "openai/clip-vit-large-patch14")
 
         # training
         self.epochs = 20
@@ -39,6 +53,18 @@ class TrainingConfig:
         self.warmup_ratio = 0.05  # warmup steps 占总步数的比例（0.01-0.1）
         self.max_grad_norm = 1.0  # 梯度裁剪，0 表示不裁剪（0-2.0）
         self.dropout = 0.1  # Dropout 比例（0.0-0.3）
+        self.grad_accum_steps = 1  # 梯度累积步数
+        self.use_amp = True  # AMP 混合精度
+        self.seed = 42  # 随机种子
+        self.output_dir = os.path.join(repo_root, "outputs")
+        self.log_csv = "training_log.csv"
+        self.resume_from = None  # 路径：从检查点恢复
+        self.early_stopping_patience = 0  # 0 表示不启用早停
+        self.early_stopping_min_delta = 1e-4
+        # dataloader
+        self.num_workers = min(4, os.cpu_count() or 1)
+        self.pin_memory = torch.cuda.is_available()
+        self.persistent_workers = True
         
         # loss weights
         self.w_q = 0.5
@@ -71,10 +97,22 @@ class TrainingConfig:
         self.partial_freeze = False  # 部分冻结 CLIP（只训练最后几层）
         self.freeze_layers = 8  # 冻结前 N 层（ViT-L 有 24 层）
 
+        # scheduler selection
+        self.scheduler = "cosine"  # cosine | linear | constant | step
+        self.step_lr_step_size = 1  # StepLR 的步长（单位：epoch）
+        self.step_lr_gamma = 0.1    # StepLR 的衰减率
+
+        # label scaling (auto by default)
+        self.label_scale_q = None  # None 表示自动根据数据推断（通常 1 或 5）
+        self.label_scale_c = None
+
 
 class BaselineDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, img_dir: str, proc: CLIPProcessor, tfm):
+    def __init__(self, df: pd.DataFrame, img_dir: str, proc: CLIPProcessor, tfm,
+                 label_scale_q: float = 5.0, label_scale_c: float = 5.0):
         self.df, self.img_dir, self.proc, self.tfm = df, img_dir, proc, tfm
+        self.label_scale_q = float(label_scale_q)
+        self.label_scale_c = float(label_scale_c)
         # optional explanation/rationale text column
         self.exp_col = "explanation" if "explanation" in df.columns else None
 
@@ -111,8 +149,8 @@ class BaselineDataset(Dataset):
             px,
             toks.input_ids[0],
             toks.attention_mask[0],
-            torch.tensor(r["mos_quality"] / 5., dtype=torch.float32),
-            torch.tensor(r["mos_align"] / 5., dtype=torch.float32),
+            torch.tensor(float(r["mos_quality"]) / self.label_scale_q, dtype=torch.float32),
+            torch.tensor(float(r["mos_align"]) / self.label_scale_c, dtype=torch.float32),
             exp_ids,
             exp_mask,
         )
@@ -475,54 +513,78 @@ class BaselineCLIPScore(nn.Module):
 
 
 def train_epoch(model, dl, opt, sched, cfg):
-    model.train();
-    totals = [0, 0, 0, 0]  # total, lq, lc, le
-    for batch in dl:
+    model.train()
+    totals = [0.0, 0.0, 0.0, 0.0]  # total, lq, lc, le
+    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.use_amp and cfg.device.type == 'cuda'))
+
+    opt.zero_grad(set_to_none=True)
+    num_batches = len(dl)
+    for step, batch in enumerate(dl):
         # unpack with optional explanation
         px, ids, mask, q_t, c_t, exp_ids, exp_mask = batch
-        px = px.to(cfg.device);
-        ids = ids.to(cfg.device);
-        mask = mask.to(cfg.device)
-        q_t = q_t.to(cfg.device);
-        c_t = c_t.to(cfg.device)
+        px = px.to(cfg.device, non_blocking=True)
+        ids = ids.to(cfg.device, non_blocking=True)
+        mask = mask.to(cfg.device, non_blocking=True)
+        q_t = q_t.to(cfg.device, non_blocking=True)
+        c_t = c_t.to(cfg.device, non_blocking=True)
         if exp_ids is not None:
-            exp_ids = exp_ids.to(cfg.device)
-            exp_mask = exp_mask.to(cfg.device)
-        opt.zero_grad()
-        q_p, c_p, img_g, txt_g, c_coarse = model(px, ids, mask)
-        lq = F.mse_loss(q_p, q_t)
+            exp_ids = exp_ids.to(cfg.device, non_blocking=True)
+            exp_mask = exp_mask.to(cfg.device, non_blocking=True)
 
-        # ===== Residual Learning for Refinement Module =====
-        if cfg.use_refinement and model.use_refinement and cfg.strict_residual:
-            # Strict residual learning: supervise the residual directly
-            # Target residual = GT - coarse (detach to prevent gradient flow to Stage 1)
-            # This enforces the refinement module to ONLY learn the correction term
-            target_residual = c_t - c_coarse.detach()
-            predicted_residual = c_p - c_coarse.detach()
-            lc = F.mse_loss(predicted_residual, target_residual)
+        with torch.cuda.amp.autocast(enabled=(cfg.use_amp and cfg.device.type == 'cuda')):
+            q_p, c_p, img_g, txt_g, c_coarse = model(px, ids, mask)
+            lq = F.mse_loss(q_p, q_t)
+
+            # ===== Residual Learning for Refinement Module =====
+            if cfg.use_refinement and model.use_refinement and cfg.strict_residual:
+                # Strict residual learning: supervise the residual directly
+                target_residual = c_t - c_coarse.detach()
+                predicted_residual = c_p - c_coarse.detach()
+                lc = F.mse_loss(predicted_residual, target_residual)
+            else:
+                # Standard learning: supervise the final score
+                lc = F.mse_loss(c_p, c_t)
+
+            le = torch.tensor(0.0, device=cfg.device)
+            if cfg.use_explanations and exp_ids is not None:
+                le = model.compute_rationale_alignment_loss(img_g, txt_g, exp_ids, exp_mask)
+
+            loss = cfg.w_q * lq + cfg.w_c * lc + (cfg.w_exp * le if cfg.use_explanations and exp_ids is not None else 0.0)
+
+        # normalize by grad_accum_steps to keep loss scale
+        loss_to_backprop = loss / max(1, cfg.grad_accum_steps)
+
+        if scaler.is_enabled():
+            scaler.scale(loss_to_backprop).backward()
         else:
-            # Standard learning: supervise the final score
-            lc = F.mse_loss(c_p, c_t)
+            loss_to_backprop.backward()
 
-        loss = cfg.w_q * lq + cfg.w_c * lc
-        le = torch.tensor(0.0, device=cfg.device)
-        if cfg.use_explanations and exp_ids is not None:
-            le = model.compute_rationale_alignment_loss(img_g, txt_g, exp_ids, exp_mask)
-            loss = loss + cfg.w_exp * le
-        loss.backward()
-        
-        # 梯度裁剪（防止梯度爆炸）
-        if cfg.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-        
-        opt.step()
-        sched.step()
-        totals[0] += loss.item();
-        totals[1] += lq.item();
-        totals[2] += lc.item();
-        totals[3] += le.item() if torch.is_tensor(le) else 0.0
+        do_step = ((step + 1) % cfg.grad_accum_steps == 0) or ((step + 1) == num_batches)
+        if do_step:
+            # 梯度裁剪（防止梯度爆炸）
+            if cfg.max_grad_norm > 0:
+                if scaler.is_enabled():
+                    scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+
+            if scaler.is_enabled():
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+            opt.zero_grad(set_to_none=True)
+            if sched is not None:
+                # scheduler 按更新步数推进（per optimizer step）
+                sched.step()
+
+        # 统计（以 batch 粒度汇总）
+        totals[0] += float(loss.item())
+        totals[1] += float(lq.item())
+        totals[2] += float(lc.item())
+        totals[3] += float(le.item()) if torch.is_tensor(le) else 0.0
+
     n = len(dl)
-    return [t / n for t in totals]
+    return [t / max(1, n) for t in totals]
 
 
 def evaluate(model, dl, cfg, print_examples=False, num_examples=5):
@@ -577,11 +639,83 @@ def evaluate(model, dl, cfg, print_examples=False, num_examples=5):
     return s_q, p_q, s_c, p_c
 
 
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Try to keep training reasonably deterministic without forcing slow algos
+    try:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    except Exception:
+        pass
+
+
+def build_scheduler(optimizer, cfg, total_update_steps: int):
+    scheduler_name = (cfg.scheduler or "cosine").lower()
+    warmup_steps = int(cfg.warmup_ratio * total_update_steps)
+    if scheduler_name == "cosine":
+        sched = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_update_steps)
+        info = f"cosine (warmup_steps={warmup_steps}, total_steps={total_update_steps})"
+        step_on = "step"
+    elif scheduler_name == "linear":
+        sched = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_update_steps)
+        info = f"linear (warmup_steps={warmup_steps}, total_steps={total_update_steps})"
+        step_on = "step"
+    elif scheduler_name == "constant":
+        sched = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps)
+        info = f"constant (warmup_steps={warmup_steps})"
+        step_on = "step"
+    elif scheduler_name == "step":
+        # Note: StepLR 不基于步数总量，此处按每 epoch step 的方式使用
+        sched = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, cfg.step_lr_step_size), gamma=cfg.step_lr_gamma)
+        info = f"step (step_size={cfg.step_lr_step_size} epoch, gamma={cfg.step_lr_gamma})"
+        step_on = "epoch"
+    else:
+        sched = None
+        info = "None"
+        step_on = "none"
+    return sched, info, step_on
+
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def save_checkpoint(path: str, model, optimizer, scheduler, epoch: int, best_sc: float):
+    to_save = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler": scheduler.state_dict() if (scheduler is not None and hasattr(scheduler, 'state_dict')) else None,
+        "epoch": epoch,
+        "best_sc": best_sc,
+        "timestamp": datetime.now().isoformat(timespec='seconds')
+    }
+    torch.save(to_save, path)
+
+
+def load_checkpoint(path: str, model, optimizer, scheduler, device):
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt.get("model", ckpt))
+    if optimizer is not None and ckpt.get("optimizer") is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if scheduler is not None and ckpt.get("scheduler") is not None:
+        try:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except Exception:
+            pass
+    start_epoch = int(ckpt.get("epoch", 0))
+    best_sc = float(ckpt.get("best_sc", -1.0))
+    return start_epoch, best_sc
+
+
 def main():
     cfg = TrainingConfig()
     parser = argparse.ArgumentParser("Baseline CLIP eval")
     parser.add_argument('--data_csv_path');
     parser.add_argument('--image_base_dir')
+    parser.add_argument('--output_dir')
     parser.add_argument('--epochs', type=int);
     parser.add_argument('--batch_size', type=int);
     parser.add_argument('--lr', type=float)
@@ -620,10 +754,27 @@ def main():
                         help='梯度裁剪阈值，0 表示不裁剪（默认 1.0）')
     parser.add_argument('--dropout', type=float,
                         help='Dropout 比例（默认 0.1）')
+    parser.add_argument('--grad_accum_steps', type=int, help='梯度累积步数（默认 1）')
+    parser.add_argument('--no_amp', action='store_true', help='禁用 AMP 混合精度（默认启用，如果有 CUDA）')
+    parser.add_argument('--seed', type=int, help='随机种子（默认 42）')
+    parser.add_argument('--num_workers', type=int, help='DataLoader 工作进程数（默认 4）')
+    parser.add_argument('--pin_memory', action='store_true', help='DataLoader 使用 pin_memory')
+    parser.add_argument('--no_pin_memory', action='store_true', help='禁用 pin_memory')
+    parser.add_argument('--scheduler', type=str, choices=['cosine', 'linear', 'constant', 'step'],
+                        help='学习率调度器类型（默认 cosine）')
+    parser.add_argument('--step_lr_step_size', type=int, help='StepLR: 衰减步长（单位：epoch）')
+    parser.add_argument('--step_lr_gamma', type=float, help='StepLR: 衰减因子（默认 0.1）')
+    parser.add_argument('--resume_from', type=str, help='从检查点恢复训练（.pt 文件路径）')
+    parser.add_argument('--log_csv', type=str, help='训练日志 CSV 文件名（默认 training_log.csv）')
+    parser.add_argument('--label_scale_q', type=float, help='Quality 标签缩放（将标签除以该值，默认自动）')
+    parser.add_argument('--label_scale_c', type=float, help='Consistency 标签缩放（将标签除以该值，默认自动）')
+    parser.add_argument('--early_stopping_patience', type=int, help='早停耐心值（0 表示不启用）')
+    parser.add_argument('--early_stopping_min_delta', type=float, help='早停最小提升阈值（默认 1e-4）')
     
     args = parser.parse_args()
     if args.data_csv_path: cfg.data_csv_path = args.data_csv_path
     if args.image_base_dir: cfg.image_base_dir = args.image_base_dir
+    if args.output_dir: cfg.output_dir = args.output_dir
     if args.epochs: cfg.epochs = args.epochs
     if args.batch_size: cfg.batch_size = args.batch_size
     if args.lr: cfg.lr = args.lr
@@ -651,8 +802,49 @@ def main():
     if args.warmup_ratio is not None: cfg.warmup_ratio = args.warmup_ratio
     if args.max_grad_norm is not None: cfg.max_grad_norm = args.max_grad_norm
     if args.dropout is not None: cfg.dropout = args.dropout
+    if args.grad_accum_steps is not None and args.grad_accum_steps > 0: cfg.grad_accum_steps = args.grad_accum_steps
+    if args.no_amp: cfg.use_amp = False
+    if args.seed is not None: cfg.seed = args.seed
+    if args.num_workers is not None: cfg.num_workers = max(0, args.num_workers)
+    if args.pin_memory: cfg.pin_memory = True
+    if args.no_pin_memory: cfg.pin_memory = False
+    if args.scheduler is not None: cfg.scheduler = args.scheduler
+    if args.step_lr_step_size is not None: cfg.step_lr_step_size = max(1, args.step_lr_step_size)
+    if args.step_lr_gamma is not None: cfg.step_lr_gamma = args.step_lr_gamma
+    if args.resume_from: cfg.resume_from = args.resume_from
+    if args.log_csv: cfg.log_csv = args.log_csv
+    if args.label_scale_q is not None: cfg.label_scale_q = float(args.label_scale_q)
+    if args.label_scale_c is not None: cfg.label_scale_c = float(args.label_scale_c)
+    if args.early_stopping_patience is not None: cfg.early_stopping_patience = max(0, int(args.early_stopping_patience))
+    if args.early_stopping_min_delta is not None: cfg.early_stopping_min_delta = float(args.early_stopping_min_delta)
 
+    # Prepare output directory
+    ensure_dir(cfg.output_dir)
+
+    # Set seeds and precision behavior
+    set_seed(cfg.seed)
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
+    # Load data
     df = pd.read_csv(cfg.data_csv_path)
+    # Auto-detect label scale if not provided
+    if cfg.label_scale_q is None:
+        # If max quality >1.5 we assume 1-5 scale
+        try:
+            max_q = float(pd.to_numeric(df["mos_quality"], errors='coerce').max())
+            cfg.label_scale_q = 5.0 if max_q > 1.5 else 1.0
+        except Exception:
+            cfg.label_scale_q = 5.0
+    if cfg.label_scale_c is None:
+        try:
+            max_c = float(pd.to_numeric(df["mos_align"], errors='coerce').max())
+            cfg.label_scale_c = 5.0 if max_c > 1.5 else 1.0
+        except Exception:
+            cfg.label_scale_c = 5.0
     train_df, val_df = train_test_split(df, test_size=cfg.test_size, random_state=42)
     proc = CLIPProcessor.from_pretrained(cfg.clip_model_name)
     tf_train = transforms.Compose([
@@ -670,10 +862,31 @@ def main():
     if cfg.explanation_column != "explanation" and cfg.explanation_column in train_df.columns:
         train_df = train_df.rename(columns={cfg.explanation_column: "explanation"})
         val_df = val_df.rename(columns={cfg.explanation_column: "explanation"})
-    train_ds = BaselineDataset(train_df, cfg.image_base_dir, proc, tf_train)
-    val_ds = BaselineDataset(val_df, cfg.image_base_dir, proc, tf_val)
-    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_dl = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_fn)
+    train_ds = BaselineDataset(train_df, cfg.image_base_dir, proc, tf_train,
+                               label_scale_q=cfg.label_scale_q, label_scale_c=cfg.label_scale_c)
+    val_ds = BaselineDataset(val_df, cfg.image_base_dir, proc, tf_val,
+                             label_scale_q=cfg.label_scale_q, label_scale_c=cfg.label_scale_c)
+    # DataLoader settings
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
+        persistent_workers=(cfg.persistent_workers and cfg.num_workers > 0),
+        drop_last=False,
+    )
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
+        persistent_workers=(cfg.persistent_workers and cfg.num_workers > 0),
+        drop_last=False,
+    )
 
     # Build refinement config
     refinement_cfg = {
@@ -696,19 +909,25 @@ def main():
         dropout=cfg.dropout
     ).to(cfg.device)
     opt = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    
-    # 学习率调度器（带 warmup）
-    total_steps = len(train_dl) * cfg.epochs
-    warmup_steps = int(cfg.warmup_ratio * total_steps)
-    sched = get_cosine_schedule_with_warmup(opt, warmup_steps, total_steps)
+
+    # 学习率调度器（支持多种策略），步数需考虑梯度累积
+    updates_per_epoch = math.ceil(len(train_dl) / max(1, cfg.grad_accum_steps))
+    total_update_steps = max(1, updates_per_epoch * cfg.epochs)
+    sched, sched_info, sched_step_on = build_scheduler(opt, cfg, total_update_steps)
 
     # Print config
     print(f"\n{'=' * 70}")
     print(f"Training Configuration:")
     print(f"  - Epochs: {cfg.epochs}, Batch Size: {cfg.batch_size}, LR: {cfg.lr}")
-    print(f"  - Optimizer: AdamW (weight_decay={cfg.weight_decay}, warmup_ratio={cfg.warmup_ratio})")
+    print(f"  - Optimizer: AdamW (weight_decay={cfg.weight_decay})")
+    print(f"  - Scheduler: {sched_info}")
+    print(f"  - Updates/epoch: {updates_per_epoch}, Total updates: {total_update_steps}")
     print(f"  - Regularization: dropout={cfg.dropout}, max_grad_norm={cfg.max_grad_norm}")
+    print(f"  - AMP: {cfg.use_amp and cfg.device.type == 'cuda'}, GradAccum: {cfg.grad_accum_steps}")
+    print(f"  - DataLoader: workers={cfg.num_workers}, pin_memory={cfg.pin_memory}")
+    print(f"  - Output Dir: {cfg.output_dir}")
     print(f"  - Loss Weights: w_q={cfg.w_q}, w_c={cfg.w_c}")
+    print(f"  - Label scale: q={cfg.label_scale_q}, c={cfg.label_scale_c}")
     print(f"  - Use Explanations: {cfg.use_explanations}" + (f" (w_exp={cfg.w_exp})" if cfg.use_explanations else ""))
     print(f"\n  🔧 CLIP 冻结策略:")
     if cfg.freeze_clip:
@@ -732,23 +951,49 @@ def main():
 
     print(f"{'=' * 70}\n")
 
-    best_sc = -1
-    for ep in range(cfg.epochs):
-        train_loss, lq, lc, le = train_epoch(model, train_dl, opt, sched, cfg)
+    # Resume support
+    start_epoch = 0
+    best_sc = -1.0
+    if cfg.resume_from is not None and os.path.isfile(cfg.resume_from):
+        try:
+            start_epoch, best_sc = load_checkpoint(cfg.resume_from, model, opt, sched, cfg.device)
+            print(f"[Resume] Loaded checkpoint from {cfg.resume_from} (start_epoch={start_epoch}, best_sc={best_sc:.4f})")
+        except Exception as e:
+            print(f"[Resume] Failed to load checkpoint: {e}")
+
+    # Prepare CSV logging
+    log_path = os.path.join(cfg.output_dir, cfg.log_csv)
+    write_header = not os.path.exists(log_path)
+
+    patience_counter = 0
+    for ep in range(start_epoch, cfg.epochs):
+        train_loss, lq, lc, le = train_epoch(model, train_dl, opt, sched if (sched is not None and sched_step_on == 'step') else None, cfg)
+
+        # If scheduler is StepLR stepped per-epoch
+        if sched is not None and sched_step_on == 'epoch':
+            sched.step()
 
         # Print examples every 5 epochs or at the last epoch
         print_examples = cfg.use_refinement and ((ep + 1) % 5 == 0 or (ep + 1) == cfg.epochs)
         s_q, p_q, s_c, p_c = evaluate(model, val_dl, cfg, print_examples=print_examples, num_examples=5)
 
+        cur_lr = opt.param_groups[0]['lr']
         if cfg.use_explanations:
             print(
-                f"Ep{ep + 1} TrainLoss={train_loss:.4f}(Q{lq:.4f},C{lc:.4f},E{le:.4f})  Val SROCC_Q={s_q:.4f},SROCC_C={s_c:.4f}")
+                f"Ep{ep + 1} TrainLoss={train_loss:.4f}(Q{lq:.4f},C{lc:.4f},E{le:.4f})  Val SROCC_Q={s_q:.4f},SROCC_C={s_c:.4f}  LR={cur_lr:.2e}")
         else:
             print(
-                f"Ep{ep + 1} TrainLoss={train_loss:.4f}(Q{lq:.4f},C{lc:.4f})  Val SROCC_Q={s_q:.4f},SROCC_C={s_c:.4f}")
+                f"Ep{ep + 1} TrainLoss={train_loss:.4f}(Q{lq:.4f},C{lc:.4f})  Val SROCC_Q={s_q:.4f},SROCC_C={s_c:.4f}  LR={cur_lr:.2e}")
 
-        if s_c > best_sc:
+        # Save last checkpoint every epoch
+        last_path = os.path.join(cfg.output_dir, "baseline_last.pt")
+        save_checkpoint(last_path, model, opt, sched, ep + 1, best_sc)
+
+        # Save best by SROCC_C
+        improved = (s_c - best_sc) > cfg.early_stopping_min_delta
+        if improved:
             best_sc = s_c
+            patience_counter = 0
             # 根据配置生成模型文件名
             if cfg.use_residual_learning:
                 if cfg.partial_freeze:
@@ -759,8 +1004,27 @@ def main():
                 save_name = "baseline_refinement_best.pt"
             else:
                 save_name = "baseline_best.pt"
-            torch.save(model.state_dict(), save_name)
-            print(f"[Checkpoint] New best SROCC_C={s_c:.4f} -> {save_name}")
+            best_path = os.path.join(cfg.output_dir, save_name)
+            torch.save(model.state_dict(), best_path)
+            # Also save a full checkpoint for resume
+            best_ckpt_path = os.path.join(cfg.output_dir, "baseline_best.pt")
+            save_checkpoint(best_ckpt_path, model, opt, sched, ep + 1, best_sc)
+            print(f"[Checkpoint] New best SROCC_C={s_c:.4f} -> {best_path}")
+        else:
+            patience_counter += 1
+
+        # Append CSV log
+        with open(log_path, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["epoch", "train_loss", "lq", "lc", "le", "s_q", "p_q", "s_c", "p_c", "best_s_c", "lr"]) 
+                write_header = False
+            writer.writerow([ep + 1, f"{train_loss:.6f}", f"{lq:.6f}", f"{lc:.6f}", f"{le:.6f}", f"{s_q:.6f}", f"{p_q:.6f}", f"{s_c:.6f}", f"{p_c:.6f}", f"{best_sc:.6f}", f"{cur_lr:.8f}"])
+
+        # Early stopping
+        if cfg.early_stopping_patience and patience_counter >= cfg.early_stopping_patience:
+            print(f"[EarlyStopping] No improvement for {patience_counter} epochs (patience={cfg.early_stopping_patience}). Stopping.")
+            break
 
     # Final evaluation with examples
     if cfg.use_refinement:

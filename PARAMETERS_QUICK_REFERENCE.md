@@ -40,6 +40,11 @@
 --warmup_ratio 0.05     # Warmup 比例（0.01-0.1）
 --max_grad_norm 1.0     # 梯度裁剪（0=不裁剪，0.5-2.0）
 --dropout 0.1           # Dropout 比例（0.0-0.3）
+--grad_accum_steps 1    # 梯度累积步数（>1 可降显存）
+--no_amp                # 禁用 AMP（默认启用，如有 CUDA）
+--seed 42               # 随机种子
+--num_workers 4         # DataLoader 进程数
+--pin_memory            # 启用 pin memory（或 --no_pin_memory 禁用）
 ```
 
 **调优建议**：
@@ -141,6 +146,16 @@
 --refinement_layers 4      # Transformer 层数
 --refinement_heads 8       # 注意力头数
 --refinement_dim 256       # 隐藏层维度
+--scheduler cosine|linear|constant|step   # 学习率调度器
+--step_lr_step_size 1      # StepLR 衰减步长（epoch）
+--step_lr_gamma 0.1        # StepLR 衰减因子
+--resume_from outputs/baseline_best.pt    # 从检查点恢复
+--output_dir outputs       # 输出目录
+--log_csv training_log.csv # 训练日志 CSV 文件名
+--early_stopping_patience 5              # 早停耐心
+--early_stopping_min_delta 0.0005        # 早停最小提升
+--label_scale_q 5.0       # Quality 标签缩放（默认自动）
+--label_scale_c 5.0       # Consistency 标签缩放（默认自动）
 ```
 
 ---
