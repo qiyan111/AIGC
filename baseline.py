@@ -34,6 +34,63 @@ from datetime import datetime
 import csv
 
 
+class LoRALinear(nn.Module):
+    """Lightweight LoRA adapter for Linear layers: y = W x + b + scale * B(Ax).
+    Keeps base Linear intact and adds a low-rank residual.
+    """
+    def __init__(self, base_linear: nn.Linear, rank: int = 8, alpha: float = 16.0, dropout: float = 0.0):
+        super().__init__()
+        self.base = base_linear
+        in_f, out_f = base_linear.in_features, base_linear.out_features
+        self.rank = max(1, int(rank))
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / self.rank
+        self.lora_A = nn.Linear(in_f, self.rank, bias=False)
+        self.lora_B = nn.Linear(self.rank, out_f, bias=False)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base(x)
+        lora_out = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+        return base_out + lora_out
+
+
+def apply_lora_to_clip(clip_model: nn.Module, rank: int = 8, alpha: float = 16.0,
+                       dropout: float = 0.0,
+                       target_names: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2")) -> None:
+    """Recursively replace target Linear modules with LoRALinear in a CLIP model."""
+    def _inject(module: nn.Module):
+        for name, child in list(module.named_children()):
+            if isinstance(child, nn.Linear) and name in target_names:
+                setattr(module, name, LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout))
+            else:
+                _inject(child)
+    _inject(clip_model)
+
+
+class MonotonicCalibrator(nn.Module):
+    """Monotonic piecewise-linear calibrator on [0,1]: sum_k softplus(a_k) * ReLU(x - t_k) + b."""
+    def __init__(self, num_knots: int = 8):
+        super().__init__()
+        self.num_knots = max(2, int(num_knots))
+        # Fixed, evenly spaced thresholds in [0,1]
+        t = torch.linspace(0.0, 1.0, steps=self.num_knots)
+        self.register_buffer("thresholds", t)
+        self.a = nn.Parameter(torch.zeros(self.num_knots))
+        self.b = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,1] in [0,1]
+        slopes = F.softplus(self.a)  # non-negative
+        # Broadcast thresholds: [1,K] -> [B,K]
+        xk = x - self.thresholds.view(1, -1)
+        xk = torch.relu(xk)
+        y = (xk * slopes.view(1, -1)).sum(dim=1, keepdim=True) + self.b
+        return y
+
+
 class TrainingConfig:
     """Hyper-parameters with sensible defaults. Can be overridden via CLI."""
 
@@ -145,6 +202,16 @@ class TrainingConfig:
         self.use_tp_cross_attn = False
         self.tp_cross_heads = 4
         self.tp_cross_layers = 1
+
+        # 10) LoRA-Adapter 注入到 CLIP 编码器（参数高效）
+        self.use_lora = False
+        self.lora_rank = 8
+        self.lora_alpha = 16.0
+        self.lora_dropout = 0.05
+
+        # 11) 一致性单调校准（保证与 cos 相似度的单调性）
+        self.use_monotonic_calib = False
+        self.calib_knots = 8
 
 
 class BaselineDataset(Dataset):
@@ -579,6 +646,10 @@ class BaselineCLIPScore(nn.Module):
         else:
             self.q_seq_proj_img = None
             self.q_patch_pool = None
+
+        # 一致性单调校准层（可选）
+        self.use_monotonic_calib = False
+        self.calibrator = MonotonicCalibrator(num_knots=8)
     
     def _partial_freeze_clip(self, freeze_layers: int):
         """部分冻结 CLIP：只训练最后几层编码器。
@@ -797,6 +868,9 @@ class BaselineCLIPScore(nn.Module):
 
             c_delta = c_delta_raw * self.residual_scale_c * gate
             c = torch.clamp(c_base + c_delta, 0.0, 1.0)
+            # 单调校准（可选）：对最终一致性分数做单调的分段线性校准
+            if self.use_monotonic_calib:
+                c = torch.sigmoid(self.calibrator(c))  # 保持在 [0,1]
             c_coarse = c_base
             
         else:
@@ -1139,6 +1213,12 @@ def main():
     parser.add_argument('--adapter_scale', type=float, help='适配器残差缩放（默认0.2）')
     parser.add_argument('--use_quality_gate', action='store_true', help='启用质量残差门控')
     parser.add_argument('--use_token_patch_cross', action='store_true', help='启用文本token与图像patch的轻量交互')
+    parser.add_argument('--use_monotonic_calib', action='store_true', help='启用一致性单调校准')
+    parser.add_argument('--calib_knots', type=int, help='单调校准分段数量（默认8）')
+    parser.add_argument('--use_lora', action='store_true', help='在CLIP编码器中注入LoRA-Adapter')
+    parser.add_argument('--lora_rank', type=int, help='LoRA 低秩维度（默认8）')
+    parser.add_argument('--lora_alpha', type=float, help='LoRA alpha（默认16.0）')
+    parser.add_argument('--lora_dropout', type=float, help='LoRA dropout（默认0.05）')
     
     args = parser.parse_args()
     if args.data_csv_path: cfg.data_csv_path = args.data_csv_path
@@ -1200,6 +1280,12 @@ def main():
     if args.adapter_scale is not None: cfg.adapter_scale = float(args.adapter_scale)
     if args.use_quality_gate: cfg.use_quality_gate = True
     if args.use_token_patch_cross: cfg.use_token_patch_cross = True
+    if args.use_monotonic_calib: cfg.use_monotonic_calib = True
+    if args.calib_knots is not None: cfg.calib_knots = max(4, int(args.calib_knots))
+    if args.use_lora: cfg.use_lora = True
+    if args.lora_rank is not None: cfg.lora_rank = max(1, int(args.lora_rank))
+    if args.lora_alpha is not None: cfg.lora_alpha = float(args.lora_alpha)
+    if args.lora_dropout is not None: cfg.lora_dropout = float(args.lora_dropout)
 
     # Prepare output directory
     ensure_dir(cfg.output_dir)
@@ -1300,6 +1386,11 @@ def main():
         use_token_patch_cross=cfg.use_token_patch_cross
     ).to(cfg.device)
     opt = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    # 结构：可选注入LoRA（在调度与训练前）
+    if cfg.use_lora:
+        apply_lora_to_clip(model.clip, rank=cfg.lora_rank, alpha=cfg.lora_alpha, dropout=cfg.lora_dropout)
+        print(f"  🔧 Injected LoRA into CLIP (rank={cfg.lora_rank}, alpha={cfg.lora_alpha}, dropout={cfg.lora_dropout})")
 
     # 学习率调度器（支持多种策略），步数需考虑梯度累积
     updates_per_epoch = math.ceil(len(train_dl) / max(1, cfg.grad_accum_steps))
