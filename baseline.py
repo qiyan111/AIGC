@@ -114,6 +114,9 @@ class TrainingConfig:
         self.cross_dim = 256
         self.dual_direction_cross = False  # text->image 与 image->text 双向融合
 
+        # 1.5) 文本token ↔ 图像patch 的轻量交互（Token-Patch Cross）
+        self.use_token_patch_cross = False
+
         # 2) 置信度门控残差（动态缩放 Δ）
         self.use_confidence_gate = False
 
@@ -130,6 +133,18 @@ class TrainingConfig:
 
         # 6) 质量残差门控（动态缩放 Δq）
         self.use_quality_gate = False
+
+        # 7) 文本自适应调制（FiLM）
+        self.use_film = False
+
+        # 8) 一致性残差 MoE（多专家）
+        self.use_moe_delta = False
+        self.num_moe_experts = 2
+
+        # 9) 文本token↔图像patch 跨注意力（更强交互）
+        self.use_tp_cross_attn = False
+        self.tp_cross_heads = 4
+        self.tp_cross_layers = 1
 
 
 class BaselineDataset(Dataset):
@@ -304,7 +319,8 @@ class BaselineCLIPScore(nn.Module):
                  cross_dim: int = 256,
                  dual_direction_cross: bool = False,
                  use_confidence_gate: bool = False,
-                 use_token_quality: bool = False):
+                 use_token_quality: bool = False,
+                 use_token_patch_cross: bool = False):
         super().__init__()
         self.clip = CLIPModel.from_pretrained(clip_model_name)
         
@@ -371,14 +387,38 @@ class BaselineCLIPScore(nn.Module):
                 nn.Tanh()
             )
 
+            # ===== MoE 残差专家（可选）=====
+            self.use_moe_delta = False
+            self.num_moe_experts = 2
+            self.moe_experts = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(dim * 2 + 1),
+                    nn.Linear(dim * 2 + 1, 128),
+                    nn.GELU(),
+                    nn.Linear(128, 1)
+                ) for _ in range(self.num_moe_experts)
+            ])
+            self.moe_gate = nn.Sequential(
+                nn.LayerNorm(dim * 2 + 1),
+                nn.Linear(dim * 2 + 1, self.num_moe_experts)
+            )
+
             # 扩展交互特征（|img-txt|, img*txt）
+            # 输入维度 = [img_g, txt_g, sim] (2*dim+1) + [|img-txt|, img*txt] (2*dim) + [filip_sim] (1)
             self.ext_inter_proj = nn.Sequential(
-                nn.LayerNorm(dim * 2 + 1 + dim * 2),
-                nn.Linear(dim * 2 + 1 + dim * 2, 256),
+                nn.LayerNorm(4 * dim + 2),
+                nn.Linear(4 * dim + 2, 256),
                 nn.GELU(),
                 nn.Linear(256, 1),
                 nn.Tanh()
             )
+
+            # 为残差路径准备序列特征投影（用于计算 FILIP 相似度）
+            v_dim = self.clip.config.vision_config.hidden_size
+            t_dim = self.clip.config.text_config.hidden_size
+            proj_dim = self.clip.config.projection_dim
+            self.res_seq_proj_img = nn.Linear(v_dim, proj_dim, bias=False) if v_dim != proj_dim else nn.Identity()
+            self.res_seq_proj_txt = nn.Linear(t_dim, proj_dim, bias=False) if t_dim != proj_dim else nn.Identity()
 
             # ===== 跨模态注意力一致性残差（模块化）=====
             self.use_cross_attn_delta = use_cross_attn_delta
@@ -410,6 +450,40 @@ class BaselineCLIPScore(nn.Module):
                 self.cross_encoder = None
                 self.cross_delta = None
 
+            # ===== 轻量 Token-Patch Cross（text token ↔ image patch）=====
+            self.use_token_patch_cross = use_token_patch_cross
+            v_dim = self.clip.config.vision_config.hidden_size
+            t_dim = self.clip.config.text_config.hidden_size
+            self.tp_img_proj = nn.Linear(v_dim, dim, bias=False) if v_dim != dim else nn.Identity()
+            self.tp_txt_proj = nn.Linear(t_dim, dim, bias=False) if t_dim != dim else nn.Identity()
+            self.tp_score_head = nn.Sequential(
+                nn.LayerNorm(dim * 2 + 2),
+                nn.Linear(dim * 2 + 2, 128),
+                nn.GELU(),
+                nn.Linear(128, 1),
+                nn.Tanh()
+            )
+
+            # 更强的 token↔patch Cross-Attention（可选）
+            self.use_tp_cross_attn = False
+            self.tp_cross_heads = 4
+            self.tp_cross_layers = 1
+            self.tp_cross_img_in = nn.Linear(v_dim, dim, bias=False) if v_dim != dim else nn.Identity()
+            self.tp_cross_txt_in = nn.Linear(t_dim, dim, bias=False) if t_dim != dim else nn.Identity()
+            ca_layer = nn.TransformerEncoderLayer(
+                d_model=dim, nhead=self.tp_cross_heads,
+                dim_feedforward=dim * 2, dropout=0.1,
+                activation='gelu', batch_first=True
+            )
+            self.tp_cross_encoder = nn.TransformerEncoder(ca_layer, num_layers=self.tp_cross_layers)
+            self.tp_cross_delta = nn.Sequential(
+                nn.LayerNorm(dim * 2 + 2),
+                nn.Linear(dim * 2 + 2, 128),
+                nn.GELU(),
+                nn.Linear(128, 1),
+                nn.Tanh()
+            )
+
             # ===== 置信度门控残差 =====
             self.use_confidence_gate = use_confidence_gate
             if self.use_confidence_gate:
@@ -422,6 +496,20 @@ class BaselineCLIPScore(nn.Module):
                 )
             else:
                 self.conf_gate = None
+
+            # ===== 残差分支自适应混合器（Delta Mixer）=====
+            self.use_delta_mixer = True
+            self.delta_gate_mlp = nn.Sequential(
+                nn.LayerNorm(dim * 2 + 1),
+                nn.Linear(dim * 2 + 1, 128),
+                nn.GELU()
+            )
+            self.delta_gate_heads = nn.ModuleDict({
+                'mlp': nn.Linear(128, 1),
+                'cross': nn.Linear(128, 1),
+                'ext': nn.Linear(128, 1),
+                'tp': nn.Linear(128, 1),
+            })
         else:
             # 传统模式
             self.c_scale = nn.Parameter(torch.tensor(5.0))  # branch-A (global cos)
@@ -459,6 +547,11 @@ class BaselineCLIPScore(nn.Module):
         self.txt_adapter = nn.Sequential(
             nn.LayerNorm(dim), nn.Linear(dim, dim // 2), nn.GELU(), nn.Linear(dim // 2, dim)
         )
+
+        # 文本 FiLM 调制（可选）：用文本嵌入生成缩放与偏置，调制图像残差输入
+        self.use_film = False
+        self.film_gamma = nn.Linear(dim, dim)
+        self.film_beta = nn.Linear(dim, dim)
 
         # Consistency Refinement Module (optional, two-stage)
         # 注意：残差学习模式下不再使用 refinement module，因为已经内置了残差机制
@@ -535,7 +628,9 @@ class BaselineCLIPScore(nn.Module):
                 use_ext_interactions: bool = False,
                 use_adapters: bool = False,
                 adapter_scale: float = 0.2,
-                use_quality_gate: bool = False):
+                use_quality_gate: bool = False,
+                use_film: bool = False,
+                use_moe_delta: bool = False):
         out = self.clip(pixel_values=pixel_values, input_ids=ids, attention_mask=mask, return_dict=True)
         img_g = F.normalize(out.image_embeds, dim=-1)  # [B,dim]
         txt_g = F.normalize(out.text_embeds, dim=-1)  # [B,dim]
@@ -561,9 +656,18 @@ class BaselineCLIPScore(nn.Module):
                 weights = weights.mean(dim=-1, keepdim=True)  # [B,Np,1]
                 weights = torch.softmax(weights, dim=1)
                 pooled = (patches * weights).sum(dim=1)  # [B,dim]
+                if use_film:
+                    gamma = self.film_gamma(txt_g)
+                    beta = self.film_beta(txt_g)
+                    pooled = pooled * (1 + torch.tanh(gamma)) + torch.tanh(beta)
                 q_delta_raw = self.q_delta_head(pooled)
             else:
-                q_delta_raw = self.q_delta_head(img_g)
+                pooled = img_g
+                if use_film:
+                    gamma = self.film_gamma(txt_g)
+                    beta = self.film_beta(txt_g)
+                    pooled = pooled * (1 + torch.tanh(gamma)) + torch.tanh(beta)
+                q_delta_raw = self.q_delta_head(pooled)
             if use_quality_gate:
                 q_gate = self.quality_gate(img_g)
             else:
@@ -589,7 +693,14 @@ class BaselineCLIPScore(nn.Module):
             # Delta: 两种路径
             # A. 简单融合 MLP（默认）
             fused = torch.cat([img_g, txt_g, sim], dim=1)  # [B, dim*2+1]
-            c_delta_mlp = self.c_delta_head(fused)  # [-1,1]
+            if use_moe_delta and len(self.moe_experts) > 0:
+                logits = self.moe_gate(fused)
+                weights = torch.softmax(logits, dim=-1)  # [B,E]
+                expert_outs = torch.stack([exp(fused) for exp in self.moe_experts], dim=-1)  # [B,1,E]
+                c_delta_mlp = torch.sum(expert_outs * weights.unsqueeze(1), dim=-1)  # [B,1]
+                c_delta_mlp = torch.tanh(c_delta_mlp)  # [-1,1]
+            else:
+                c_delta_mlp = self.c_delta_head(fused)  # [-1,1]
 
             # B. 轻量跨模态注意力（可选）
             if (self.use_cross_attn_delta or use_cross_attn_delta) and self.cross_in is not None:
@@ -606,13 +717,77 @@ class BaselineCLIPScore(nn.Module):
             else:
                 c_delta_raw = c_delta_mlp
 
-            # C. 扩展交互（可选）：拼接 |img-txt| 与 img*txt 提供更丰富的交互先验
-            if use_ext_interactions:
+            # C. 扩展交互（可选）：加入 |img-txt|、img*txt 以及简化版 FILIP 相似度
+            if use_ext_interactions and hasattr(out, 'vision_model_output') and hasattr(out, 'text_model_output'):
+                img_seq = out.vision_model_output.last_hidden_state  # [B,Np+1,v_dim]
+                txt_seq = out.text_model_output.last_hidden_state   # [B,Nt,t_dim]
+                img_seq = self.res_seq_proj_img(img_seq)
+                txt_seq = self.res_seq_proj_txt(txt_seq)
+                img_seq = F.normalize(img_seq, dim=-1)
+                txt_seq = F.normalize(txt_seq, dim=-1)
+                # 取去除CLS的 patch/token
+                img_patches = img_seq[:, 1:, :]  # [B,Np,dim]
+                # 对每个文本token取与所有patch的最大相似，再做平均（text->img）
+                t2i = torch.max(torch.einsum('bid,bjd->bij', txt_seq, img_patches), dim=2).values.mean(1, keepdim=True)
+                # img->text（每个patch对所有token取最大相似再平均）
+                i2t = torch.max(torch.einsum('bid,bjd->bij', img_patches, txt_seq), dim=2).values.mean(1, keepdim=True)
+                filip_sim = 0.5 * (t2i + i2t)  # [B,1]
+
                 inter_abs = torch.abs(img_g - txt_g)
                 inter_mul = img_g * txt_g
-                ext = torch.cat([img_g, txt_g, sim, inter_abs, inter_mul], dim=1)
+                ext = torch.cat([img_g, txt_g, sim, inter_abs, inter_mul, filip_sim], dim=1)
                 c_delta_ext = self.ext_inter_proj(ext)
                 c_delta_raw = 0.5 * (c_delta_raw + c_delta_ext)
+
+            # D. 轻量 Token-Patch Cross（可选）：基于 text token 与 image patch 局部对齐得分
+            if self.use_token_patch_cross and hasattr(out, 'vision_model_output') and hasattr(out, 'text_model_output'):
+                img_seq = out.vision_model_output.last_hidden_state  # [B,Np+1,v_dim]
+                txt_seq = out.text_model_output.last_hidden_state   # [B,Nt,t_dim]
+                img_patches = self.tp_img_proj(img_seq[:, 1:, :])  # [B,Np,dim]
+                txt_tokens = self.tp_txt_proj(txt_seq)              # [B,Nt,dim]
+                img_patches = F.normalize(img_patches, dim=-1)
+                txt_tokens = F.normalize(txt_tokens, dim=-1)
+                # 文本token -> 对应最相关的图像patch 相似度，取均值
+                t2i_local = torch.max(torch.einsum('bid,bjd->bij', txt_tokens, img_patches), dim=2).values.mean(1, keepdim=True)  # [B,1]
+                # 图像patch -> 文本token
+                i2t_local = torch.max(torch.einsum('bid,bjd->bij', img_patches, txt_tokens), dim=2).values.mean(1, keepdim=True)  # [B,1]
+                cross_local = 0.5 * (t2i_local + i2t_local)
+                tp_feat = torch.cat([img_g, txt_g, sim, cross_local], dim=1)  # [B, 2*dim+2]
+                c_delta_tp = self.tp_score_head(tp_feat)
+                c_delta_raw = 0.5 * (c_delta_raw + c_delta_tp)
+
+            # E. 更强 Token↔Patch Cross-Attention（可选）：拼接序列后通过小 Transformer 编码
+            if self.use_tp_cross_attn and hasattr(out, 'vision_model_output') and hasattr(out, 'text_model_output'):
+                img_seq = out.vision_model_output.last_hidden_state[:, 1:, :]  # [B,Np,v_dim]
+                txt_seq = out.text_model_output.last_hidden_state              # [B,Nt,t_dim]
+                img_seq = F.normalize(self.tp_cross_img_in(img_seq), dim=-1)
+                txt_seq = F.normalize(self.tp_cross_txt_in(txt_seq), dim=-1)
+                seq = torch.cat([txt_seq, img_seq], dim=1)  # [B,Nt+Np,dim]
+                enc = self.tp_cross_encoder(seq)[:, 0, :]   # 取首 token 作为汇聚（粗略）
+                tp_ca_feat = torch.cat([img_g, txt_g, sim, torch.tanh(enc.mean(dim=-1, keepdim=True))], dim=1)
+                c_delta_tp2 = self.tp_cross_delta(tp_ca_feat)
+                c_delta_raw = 0.5 * (c_delta_raw + c_delta_tp2)
+
+            # 残差分支混合（learned gating over branches）
+            if self.use_delta_mixer:
+                gate_feat = self.delta_gate_mlp(fused)
+                parts = {'mlp': c_delta_mlp}
+                if (self.use_cross_attn_delta or use_cross_attn_delta) and 'c_delta_cross' in locals():
+                    parts['cross'] = c_delta_cross
+                if use_ext_interactions and 'c_delta_ext' in locals():
+                    parts['ext'] = c_delta_ext
+                if self.use_token_patch_cross and 'c_delta_tp' in locals():
+                    parts['tp'] = c_delta_tp
+                # 计算每个分支的 gate，然后归一化
+                gates = []
+                deltas = []
+                for key, val in parts.items():
+                    g = torch.sigmoid(self.delta_gate_heads[key](gate_feat))  # [B,1]
+                    gates.append(g)
+                    deltas.append(val)
+                gate_sum = torch.clamp(sum(gates), min=1e-6)
+                weights = [g / gate_sum for g in gates]
+                c_delta_raw = sum(w * d for w, d in zip(weights, deltas))
 
             # 置信度门控（可选）：根据融合特征输出 gate ∈ [0,1] 对残差缩放
             if (self.use_confidence_gate or use_confidence_gate) and self.conf_gate is not None:
@@ -963,6 +1138,7 @@ def main():
     parser.add_argument('--use_adapters', action='store_true', help='启用轻量适配器细调全局表征')
     parser.add_argument('--adapter_scale', type=float, help='适配器残差缩放（默认0.2）')
     parser.add_argument('--use_quality_gate', action='store_true', help='启用质量残差门控')
+    parser.add_argument('--use_token_patch_cross', action='store_true', help='启用文本token与图像patch的轻量交互')
     
     args = parser.parse_args()
     if args.data_csv_path: cfg.data_csv_path = args.data_csv_path
@@ -1023,6 +1199,7 @@ def main():
     if args.use_adapters: cfg.use_adapters = True
     if args.adapter_scale is not None: cfg.adapter_scale = float(args.adapter_scale)
     if args.use_quality_gate: cfg.use_quality_gate = True
+    if args.use_token_patch_cross: cfg.use_token_patch_cross = True
 
     # Prepare output directory
     ensure_dir(cfg.output_dir)
@@ -1119,7 +1296,8 @@ def main():
         cross_dim=cfg.cross_dim,
         dual_direction_cross=cfg.dual_direction_cross,
         use_confidence_gate=cfg.use_confidence_gate,
-        use_token_quality=cfg.use_token_quality
+        use_token_quality=cfg.use_token_quality,
+        use_token_patch_cross=cfg.use_token_patch_cross
     ).to(cfg.device)
     opt = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
