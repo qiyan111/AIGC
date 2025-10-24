@@ -278,19 +278,22 @@ class ConsistencyRefinementModule(nn.Module):
 
 
 class BaselineCLIPScore(nn.Module):
-    """Use CLIP global image/text embeddings -> simple regression heads.
-    
-    支持两种模式：
-    1. 传统模式：直接预测分数
-    2. 残差学习模式：预测 delta，最终分数 = CLIP_base_score + delta
-    """
+    """Use CLIP global image/text embeddings -> residual heads with optional modules."""
 
     def __init__(self, clip_model_name: str, freeze: bool = False,
                  use_refinement: bool = False, refinement_cfg: dict = None,
                  use_two_branch: bool = False, use_residual_learning: bool = True,
                  residual_scale_q: float = 0.2, residual_scale_c: float = 0.2,
                  partial_freeze: bool = False, freeze_layers: int = 8,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 # 新增：可选架构模块
+                 use_cross_attn_delta: bool = False,
+                 cross_layers: int = 1,
+                 cross_heads: int = 4,
+                 cross_dim: int = 256,
+                 dual_direction_cross: bool = False,
+                 use_confidence_gate: bool = False,
+                 use_token_quality: bool = False):
         super().__init__()
         self.clip = CLIPModel.from_pretrained(clip_model_name)
         
@@ -315,7 +318,6 @@ class BaselineCLIPScore(nn.Module):
             # Base score 使用简单投影（可训练但小幅度）
             self.q_base_head = nn.Linear(dim, 1)
             # Delta predictor: 学习小的微调量
-            # 若启用 token 级质量分支，则在 forward 中改为基于 patch token 汇聚
             self.q_delta_head = nn.Sequential(
                 nn.Linear(dim, 128),
                 nn.GELU(),
@@ -350,21 +352,48 @@ class BaselineCLIPScore(nn.Module):
                 nn.Tanh()
             )
 
-            # ===== 新增：跨模态注意力用于一致性残差 =====
-            # 将 img_g, txt_g 看作单 token，拼接成长度2序列，做轻量多头注意力
-            self.use_cross_attn_delta = False  # 实例标记，真实控制由 cfg 传入 main 中
-            self.cross_attn = None
-            self.cross_ln = None
-            self.cross_proj = None
-            # ===== 新增：置信度门控 =====
-            self.use_confidence_gate = False
-            self.conf_gate = nn.Sequential(
-                nn.LayerNorm(dim * 2 + 1),
-                nn.Linear(dim * 2 + 1, 128),
-                nn.GELU(),
-                nn.Linear(128, 1),
-                nn.Sigmoid()
-            )
+            # ===== 跨模态注意力一致性残差（模块化）=====
+            self.use_cross_attn_delta = use_cross_attn_delta
+            self.dual_direction_cross = dual_direction_cross
+            if self.use_cross_attn_delta:
+                self.cross_in = nn.Linear(dim, cross_dim, bias=False)
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=cross_dim, nhead=cross_heads,
+                    dim_feedforward=cross_dim * 2, dropout=0.1,
+                    activation='gelu', batch_first=True
+                )
+                self.cross_encoder = nn.TransformerEncoder(encoder_layer, num_layers=max(1, cross_layers))
+                if self.dual_direction_cross:
+                    self.cross_delta = nn.Sequential(
+                        nn.LayerNorm(2 * cross_dim),
+                        nn.Linear(2 * cross_dim, cross_dim),
+                        nn.GELU(),
+                        nn.Linear(cross_dim, 1),
+                        nn.Tanh()
+                    )
+                else:
+                    self.cross_delta = nn.Sequential(
+                        nn.LayerNorm(cross_dim),
+                        nn.Linear(cross_dim, 1),
+                        nn.Tanh()
+                    )
+            else:
+                self.cross_in = None
+                self.cross_encoder = None
+                self.cross_delta = None
+
+            # ===== 置信度门控残差 =====
+            self.use_confidence_gate = use_confidence_gate
+            if self.use_confidence_gate:
+                self.conf_gate = nn.Sequential(
+                    nn.LayerNorm(dim * 2 + 1),
+                    nn.Linear(dim * 2 + 1, 128),
+                    nn.GELU(),
+                    nn.Linear(128, 1),
+                    nn.Sigmoid()
+                )
+            else:
+                self.conf_gate = None
         else:
             # 传统模式
             self.c_scale = nn.Parameter(torch.tensor(5.0))  # branch-A (global cos)
@@ -407,13 +436,19 @@ class BaselineCLIPScore(nn.Module):
         else:
             self.refinement_module = None
 
-        # ===== 新增：token-level quality 分支的轻量汇聚层（可选）=====
-        self.use_token_quality = False
-        self.q_patch_pool = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim),
-            nn.GELU(),
-        )
+        # ===== token-level quality 分支（模块化）=====
+        self.use_token_quality = use_token_quality
+        v_dim = self.clip.config.vision_config.hidden_size
+        if self.use_token_quality:
+            self.q_seq_proj_img = nn.Linear(v_dim, dim, bias=False) if v_dim != dim else nn.Identity()
+            self.q_patch_pool = nn.Sequential(
+                nn.LayerNorm(dim),
+                nn.Linear(dim, dim),
+                nn.GELU(),
+            )
+        else:
+            self.q_seq_proj_img = None
+            self.q_patch_pool = None
     
     def _partial_freeze_clip(self, freeze_layers: int):
         """部分冻结 CLIP：只训练最后几层编码器。
@@ -426,17 +461,23 @@ class BaselineCLIPScore(nn.Module):
         
         # 冻结 vision encoder 的前 N 层
         if hasattr(self.clip.vision_model, 'encoder'):
-            for i, layer in enumerate(self.clip.vision_model.encoder.layer):
-                if i < freeze_layers:
-                    for param in layer.parameters():
-                        param.requires_grad = False
+            encoder = self.clip.vision_model.encoder
+            layers = getattr(encoder, 'layers', None) or getattr(encoder, 'layer', None)
+            if layers is not None:
+                for i, layer in enumerate(layers):
+                    if i < freeze_layers:
+                        for param in layer.parameters():
+                            param.requires_grad = False
         
         # 冻结 text encoder 的前 N 层
         if hasattr(self.clip.text_model, 'encoder'):
-            for i, layer in enumerate(self.clip.text_model.encoder.layer):
-                if i < freeze_layers:
-                    for param in layer.parameters():
-                        param.requires_grad = False
+            encoder = self.clip.text_model.encoder
+            layers = getattr(encoder, 'layers', None) or getattr(encoder, 'layer', None)
+            if layers is not None:
+                for i, layer in enumerate(layers):
+                    if i < freeze_layers:
+                        for param in layer.parameters():
+                            param.requires_grad = False
         
         # 始终冻结 embeddings（位置编码等）
         if hasattr(self.clip.vision_model, 'embeddings'):
@@ -446,14 +487,7 @@ class BaselineCLIPScore(nn.Module):
             for param in self.clip.text_model.embeddings.parameters():
                 param.requires_grad = False
 
-    def forward(self, pixel_values, ids, mask,
-                use_cross_attn_delta: bool = False,
-                cross_layers: int = 1,
-                cross_heads: int = 4,
-                cross_dim: int = 256,
-                dual_direction_cross: bool = False,
-                use_confidence_gate: bool = False,
-                use_token_quality: bool = False):
+    def forward(self, pixel_values, ids, mask):
         out = self.clip(pixel_values=pixel_values, input_ids=ids, attention_mask=mask, return_dict=True)
         img_g = F.normalize(out.image_embeds, dim=-1)  # [B,dim]
         txt_g = F.normalize(out.text_embeds, dim=-1)  # [B,dim]
@@ -463,19 +497,14 @@ class BaselineCLIPScore(nn.Module):
             # Base score: 基于 CLIP 图像特征的简单投影
             q_base = torch.sigmoid(self.q_base_head(img_g))
             # Delta: 支持可选的 token-level 感知
-            if use_token_quality and hasattr(out, 'vision_model_output') and out.vision_model_output is not None:
+            if self.use_token_quality and hasattr(out, 'vision_model_output') and out.vision_model_output is not None:
                 img_seq = out.vision_model_output.last_hidden_state  # [B,Np+1,v_dim]
                 # 丢弃 cls token（索引0），做简单的注意力权重近似：用 q_patch_pool 生成权重，再均值
                 patches = img_seq[:, 1:, :]
                 # 投到投影维度
-                # 使用 clip.config.projection_dim 对齐
-                v_dim = patches.size(-1)
-                proj_dim = self.clip.config.projection_dim
-                if v_dim != proj_dim:
-                    proj = nn.Linear(v_dim, proj_dim, bias=False).to(patches.device)
-                    patches = proj(patches)
+                patches = self.q_seq_proj_img(patches) if self.q_seq_proj_img is not None else patches
                 patches = F.normalize(patches, dim=-1)
-                weights = self.q_patch_pool(patches)  # [B,Np,dim]
+                weights = self.q_patch_pool(patches) if self.q_patch_pool is not None else patches
                 weights = weights.mean(dim=-1, keepdim=True)  # [B,Np,1]
                 weights = torch.softmax(weights, dim=1)
                 pooled = (patches * weights).sum(dim=1)  # [B,dim]
@@ -505,49 +534,22 @@ class BaselineCLIPScore(nn.Module):
             c_delta_mlp = self.c_delta_head(fused)  # [-1,1]
 
             # B. 轻量跨模态注意力（可选）
-            if use_cross_attn_delta:
-                # 动态构造一次轻量 cross attention 堆栈（避免常驻参数过大）
-                d_model = cross_dim
-                proj_in = nn.Linear(dim, d_model, bias=False).to(fused.device)
-                proj_out = nn.Linear(d_model, dim, bias=False).to(fused.device)
-                blocks = nn.ModuleList([
-                    nn.TransformerEncoderLayer(
-                        d_model=d_model, nhead=cross_heads,
-                        dim_feedforward=d_model * 2, dropout=0.1,
-                        activation='gelu', batch_first=True
-                    ).to(fused.device)
-                    for _ in range(max(1, cross_layers))
-                ])
-                # 构造长度为2的序列：[img_g, txt_g]
+            if self.use_cross_attn_delta and self.cross_in is not None:
                 seq = torch.stack([img_g, txt_g], dim=1)  # [B,2,dim]
-                seq = proj_in(seq)  # [B,2,d_model]
-                for blk in blocks:
-                    seq = blk(seq)
-                # 双向/单向汇聚
-                if dual_direction_cross:
-                    cross_feat = seq.reshape(seq.size(0), -1)  # [B,2*d_model]
-                    cross_delta = nn.Sequential(
-                        nn.LayerNorm(2 * d_model),
-                        nn.Linear(2 * d_model, d_model),
-                        nn.GELU(),
-                        nn.Linear(d_model, 1),
-                        nn.Tanh()
-                    ).to(seq.device)(cross_feat)
+                seq = self.cross_in(seq)  # [B,2,cross_dim]
+                seq = self.cross_encoder(seq)  # [B,2,cross_dim]
+                if self.dual_direction_cross:
+                    cross_feat = seq.reshape(seq.size(0), -1)  # [B,2*cross_dim]
+                    c_delta_cross = self.cross_delta(cross_feat)
                 else:
-                    # 仅取 img token，并映射
-                    cross_img = seq[:, 0, :]  # [B,d_model]
-                    cross_delta = nn.Sequential(
-                        nn.LayerNorm(d_model),
-                        nn.Linear(d_model, 1),
-                        nn.Tanh()
-                    ).to(seq.device)(cross_img)
-                c_delta_cross = cross_delta
+                    cross_img = seq[:, 0, :]  # [B,cross_dim]
+                    c_delta_cross = self.cross_delta(cross_img)
                 c_delta_raw = 0.5 * (c_delta_mlp + c_delta_cross)
             else:
                 c_delta_raw = c_delta_mlp
 
             # 置信度门控（可选）：根据融合特征输出 gate ∈ [0,1] 对残差缩放
-            if use_confidence_gate:
+            if self.use_confidence_gate and self.conf_gate is not None:
                 gate = self.conf_gate(fused)  # [B,1]
             else:
                 gate = 1.0
@@ -882,6 +884,15 @@ def main():
     parser.add_argument('--label_scale_c', type=float, help='Consistency 标签缩放（将标签除以该值，默认自动）')
     parser.add_argument('--early_stopping_patience', type=int, help='早停耐心值（0 表示不启用）')
     parser.add_argument('--early_stopping_min_delta', type=float, help='早停最小提升阈值（默认 1e-4）')
+
+    # ===== 新增：架构模块 CLI 开关 =====
+    parser.add_argument('--use_cross_attn_delta', action='store_true', help='启用跨模态注意力一致性残差')
+    parser.add_argument('--cross_layers', type=int, help='跨模态注意力层数（默认1）')
+    parser.add_argument('--cross_heads', type=int, help='跨模态注意力头数（默认4）')
+    parser.add_argument('--cross_dim', type=int, help='跨模态注意力隐藏维度（默认256）')
+    parser.add_argument('--dual_direction_cross', action='store_true', help='跨模态注意力使用双向聚合')
+    parser.add_argument('--use_confidence_gate', action='store_true', help='启用置信度门控残差')
+    parser.add_argument('--use_token_quality', action='store_true', help='启用基于patch的质量残差输入')
     
     args = parser.parse_args()
     if args.data_csv_path: cfg.data_csv_path = args.data_csv_path
@@ -929,6 +940,15 @@ def main():
     if args.label_scale_c is not None: cfg.label_scale_c = float(args.label_scale_c)
     if args.early_stopping_patience is not None: cfg.early_stopping_patience = max(0, int(args.early_stopping_patience))
     if args.early_stopping_min_delta is not None: cfg.early_stopping_min_delta = float(args.early_stopping_min_delta)
+
+    # 架构模块参数
+    if args.use_cross_attn_delta: cfg.use_cross_attn_delta = True
+    if args.cross_layers is not None: cfg.cross_layers = max(1, args.cross_layers)
+    if args.cross_heads is not None: cfg.cross_heads = max(1, args.cross_heads)
+    if args.cross_dim is not None: cfg.cross_dim = max(32, args.cross_dim)
+    if args.dual_direction_cross: cfg.dual_direction_cross = True
+    if args.use_confidence_gate: cfg.use_confidence_gate = True
+    if args.use_token_quality: cfg.use_token_quality = True
 
     # Prepare output directory
     ensure_dir(cfg.output_dir)
@@ -1018,7 +1038,14 @@ def main():
         residual_scale_c=cfg.residual_scale_c,
         partial_freeze=cfg.partial_freeze,
         freeze_layers=cfg.freeze_layers,
-        dropout=cfg.dropout
+        dropout=cfg.dropout,
+        use_cross_attn_delta=cfg.use_cross_attn_delta,
+        cross_layers=cfg.cross_layers,
+        cross_heads=cfg.cross_heads,
+        cross_dim=cfg.cross_dim,
+        dual_direction_cross=cfg.dual_direction_cross,
+        use_confidence_gate=cfg.use_confidence_gate,
+        use_token_quality=cfg.use_token_quality
     ).to(cfg.device)
     opt = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
