@@ -47,11 +47,11 @@ env/
 checkpoint/
 checkpoints/
 
-# 数据
-data/
+# 数据（允许 data/ 目录上传）
+# data/  # 已注释，允许上传 data 目录
 dataset/
 datasets/
-*.csv
+# *.csv  # 已注释，允许上传 CSV 文件
 *.json
 !train.json
 *.txt
@@ -59,14 +59,14 @@ datasets/
 *.pdf
 !*.md
 
-# 图像文件
-*.jpg
-*.jpeg
-*.png
-!paper_style.png
-!model_architecture_paper_style.png
-!gnn_alignment_paper_style.png
-!model_architecture_flowchart.png
+# 图像文件（允许 data/ 目录中的图像）
+# *.jpg  # 已注释，允许上传图像
+# *.jpeg
+# *.png
+# !paper_style.png
+# !model_architecture_paper_style.png
+# !gnn_alignment_paper_style.png
+# !model_architecture_flowchart.png
 *.gif
 *.bmp
 
