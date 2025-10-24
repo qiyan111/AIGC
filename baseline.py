@@ -106,6 +106,20 @@ class TrainingConfig:
         self.label_scale_q = None  # None 表示自动根据数据推断（通常 1 或 5）
         self.label_scale_c = None
 
+        # ===== 新增：架构改进开关 =====
+        # 1) 轻量级跨模态注意力，用于一致性残差特征
+        self.use_cross_attn_delta = False
+        self.cross_layers = 1
+        self.cross_heads = 4
+        self.cross_dim = 256
+        self.dual_direction_cross = False  # text->image 与 image->text 双向融合
+
+        # 2) 置信度门控残差（动态缩放 Δ）
+        self.use_confidence_gate = False
+
+        # 3) 质量分支使用 patch token 进行细粒度感知
+        self.use_token_quality = False
+
 
 class BaselineDataset(Dataset):
     def __init__(self, df: pd.DataFrame, img_dir: str, proc: CLIPProcessor, tfm,
@@ -301,12 +315,13 @@ class BaselineCLIPScore(nn.Module):
             # Base score 使用简单投影（可训练但小幅度）
             self.q_base_head = nn.Linear(dim, 1)
             # Delta predictor: 学习小的微调量
+            # 若启用 token 级质量分支，则在 forward 中改为基于 patch token 汇聚
             self.q_delta_head = nn.Sequential(
                 nn.Linear(dim, 128),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(128, 1),
-                nn.Tanh()  # 输出范围 [-1, 1]
+                nn.Tanh()
             )
         else:
             # 传统模式：直接预测
@@ -332,7 +347,23 @@ class BaselineCLIPScore(nn.Module):
                 nn.Linear(256, 64),
                 nn.GELU(),
                 nn.Linear(64, 1),
-                nn.Tanh()  # 输出范围 [-1, 1]
+                nn.Tanh()
+            )
+
+            # ===== 新增：跨模态注意力用于一致性残差 =====
+            # 将 img_g, txt_g 看作单 token，拼接成长度2序列，做轻量多头注意力
+            self.use_cross_attn_delta = False  # 实例标记，真实控制由 cfg 传入 main 中
+            self.cross_attn = None
+            self.cross_ln = None
+            self.cross_proj = None
+            # ===== 新增：置信度门控 =====
+            self.use_confidence_gate = False
+            self.conf_gate = nn.Sequential(
+                nn.LayerNorm(dim * 2 + 1),
+                nn.Linear(dim * 2 + 1, 128),
+                nn.GELU(),
+                nn.Linear(128, 1),
+                nn.Sigmoid()
             )
         else:
             # 传统模式
@@ -375,6 +406,14 @@ class BaselineCLIPScore(nn.Module):
             )
         else:
             self.refinement_module = None
+
+        # ===== 新增：token-level quality 分支的轻量汇聚层（可选）=====
+        self.use_token_quality = False
+        self.q_patch_pool = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+        )
     
     def _partial_freeze_clip(self, freeze_layers: int):
         """部分冻结 CLIP：只训练最后几层编码器。
@@ -407,7 +446,14 @@ class BaselineCLIPScore(nn.Module):
             for param in self.clip.text_model.embeddings.parameters():
                 param.requires_grad = False
 
-    def forward(self, pixel_values, ids, mask):
+    def forward(self, pixel_values, ids, mask,
+                use_cross_attn_delta: bool = False,
+                cross_layers: int = 1,
+                cross_heads: int = 4,
+                cross_dim: int = 256,
+                dual_direction_cross: bool = False,
+                use_confidence_gate: bool = False,
+                use_token_quality: bool = False):
         out = self.clip(pixel_values=pixel_values, input_ids=ids, attention_mask=mask, return_dict=True)
         img_g = F.normalize(out.image_embeds, dim=-1)  # [B,dim]
         txt_g = F.normalize(out.text_embeds, dim=-1)  # [B,dim]
@@ -416,8 +462,26 @@ class BaselineCLIPScore(nn.Module):
         if self.use_residual_learning:
             # Base score: 基于 CLIP 图像特征的简单投影
             q_base = torch.sigmoid(self.q_base_head(img_g))
-            # Delta: 学习的微调量（有界）
-            q_delta = self.q_delta_head(img_g) * self.residual_scale_q
+            # Delta: 支持可选的 token-level 感知
+            if use_token_quality and hasattr(out, 'vision_model_output') and out.vision_model_output is not None:
+                img_seq = out.vision_model_output.last_hidden_state  # [B,Np+1,v_dim]
+                # 丢弃 cls token（索引0），做简单的注意力权重近似：用 q_patch_pool 生成权重，再均值
+                patches = img_seq[:, 1:, :]
+                # 投到投影维度
+                # 使用 clip.config.projection_dim 对齐
+                v_dim = patches.size(-1)
+                proj_dim = self.clip.config.projection_dim
+                if v_dim != proj_dim:
+                    proj = nn.Linear(v_dim, proj_dim, bias=False).to(patches.device)
+                    patches = proj(patches)
+                patches = F.normalize(patches, dim=-1)
+                weights = self.q_patch_pool(patches)  # [B,Np,dim]
+                weights = weights.mean(dim=-1, keepdim=True)  # [B,Np,1]
+                weights = torch.softmax(weights, dim=1)
+                pooled = (patches * weights).sum(dim=1)  # [B,dim]
+                q_delta = self.q_delta_head(pooled) * self.residual_scale_q
+            else:
+                q_delta = self.q_delta_head(img_g) * self.residual_scale_q
             # 最终分数 = base + delta，并 clip 到 [0, 1]
             q = torch.clamp(q_base + q_delta, 0.0, 1.0)
         else:
@@ -428,21 +492,69 @@ class BaselineCLIPScore(nn.Module):
         sim = (img_g * txt_g).sum(-1, keepdim=True)  # [B,1] cosine similarity
         
         if self.use_residual_learning:
-            # ===== 纯残差学习模式 =====
+            # ===== 纯残差学习模式（改进：可选跨模态注意力与置信度门控）=====
             # Base score: CLIP 的原始 cosine similarity（保留对齐空间）
             # 映射到 [0, 1] 区间：(sim + 1) / 2，因为 sim ∈ [-1, 1]
             c_base = (sim + 1.0) / 2.0  # [B,1]
-            # 可选：添加小的可学习 scale 和 bias（保持接近 1 和 0）
             c_base = self.c_base_scale * c_base + self.c_base_bias
             c_base = torch.clamp(c_base, 0.0, 1.0)
-            
-            # Delta: Fusion head 预测微调量
+
+            # Delta: 两种路径
+            # A. 简单融合 MLP（默认）
             fused = torch.cat([img_g, txt_g, sim], dim=1)  # [B, dim*2+1]
-            c_delta = self.c_delta_head(fused) * self.residual_scale_c  # [B,1], 范围被缩放
-            
-            # 最终分数 = CLIP_base + delta
+            c_delta_mlp = self.c_delta_head(fused)  # [-1,1]
+
+            # B. 轻量跨模态注意力（可选）
+            if use_cross_attn_delta:
+                # 动态构造一次轻量 cross attention 堆栈（避免常驻参数过大）
+                d_model = cross_dim
+                proj_in = nn.Linear(dim, d_model, bias=False).to(fused.device)
+                proj_out = nn.Linear(d_model, dim, bias=False).to(fused.device)
+                blocks = nn.ModuleList([
+                    nn.TransformerEncoderLayer(
+                        d_model=d_model, nhead=cross_heads,
+                        dim_feedforward=d_model * 2, dropout=0.1,
+                        activation='gelu', batch_first=True
+                    ).to(fused.device)
+                    for _ in range(max(1, cross_layers))
+                ])
+                # 构造长度为2的序列：[img_g, txt_g]
+                seq = torch.stack([img_g, txt_g], dim=1)  # [B,2,dim]
+                seq = proj_in(seq)  # [B,2,d_model]
+                for blk in blocks:
+                    seq = blk(seq)
+                # 双向/单向汇聚
+                if dual_direction_cross:
+                    cross_feat = seq.reshape(seq.size(0), -1)  # [B,2*d_model]
+                    cross_delta = nn.Sequential(
+                        nn.LayerNorm(2 * d_model),
+                        nn.Linear(2 * d_model, d_model),
+                        nn.GELU(),
+                        nn.Linear(d_model, 1),
+                        nn.Tanh()
+                    ).to(seq.device)(cross_feat)
+                else:
+                    # 仅取 img token，并映射
+                    cross_img = seq[:, 0, :]  # [B,d_model]
+                    cross_delta = nn.Sequential(
+                        nn.LayerNorm(d_model),
+                        nn.Linear(d_model, 1),
+                        nn.Tanh()
+                    ).to(seq.device)(cross_img)
+                c_delta_cross = cross_delta
+                c_delta_raw = 0.5 * (c_delta_mlp + c_delta_cross)
+            else:
+                c_delta_raw = c_delta_mlp
+
+            # 置信度门控（可选）：根据融合特征输出 gate ∈ [0,1] 对残差缩放
+            if use_confidence_gate:
+                gate = self.conf_gate(fused)  # [B,1]
+            else:
+                gate = 1.0
+
+            c_delta = c_delta_raw * self.residual_scale_c * gate
             c = torch.clamp(c_base + c_delta, 0.0, 1.0)
-            c_coarse = c_base  # 用于调试和监控
+            c_coarse = c_base
             
         else:
             # ===== 传统模式（多分支融合）=====
