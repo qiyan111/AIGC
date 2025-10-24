@@ -120,6 +120,17 @@ class TrainingConfig:
         # 3) 质量分支使用 patch token 进行细粒度感知
         self.use_token_quality = False
 
+        # 4) 扩展交互特征（Hadamard 与 L1 差）用于一致性残差
+        self.use_ext_interactions = False
+
+        # 5) 轻量适配器（Adapter）调整 img/text 全局特征
+        self.use_adapters = False
+        self.adapter_dim = 64
+        self.adapter_scale = 0.2
+
+        # 6) 质量残差门控（动态缩放 Δq）
+        self.use_quality_gate = False
+
 
 class BaselineDataset(Dataset):
     def __init__(self, df: pd.DataFrame, img_dir: str, proc: CLIPProcessor, tfm,
@@ -325,6 +336,14 @@ class BaselineCLIPScore(nn.Module):
                 nn.Linear(128, 1),
                 nn.Tanh()
             )
+            # 质量门控（可选）
+            self.quality_gate = nn.Sequential(
+                nn.LayerNorm(dim),
+                nn.Linear(dim, 64),
+                nn.GELU(),
+                nn.Linear(64, 1),
+                nn.Sigmoid()
+            )
         else:
             # 传统模式：直接预测
             self.q_head = nn.Linear(dim, 1)
@@ -349,6 +368,15 @@ class BaselineCLIPScore(nn.Module):
                 nn.Linear(256, 64),
                 nn.GELU(),
                 nn.Linear(64, 1),
+                nn.Tanh()
+            )
+
+            # 扩展交互特征（|img-txt|, img*txt）
+            self.ext_inter_proj = nn.Sequential(
+                nn.LayerNorm(dim * 2 + 1 + dim * 2),
+                nn.Linear(dim * 2 + 1 + dim * 2, 256),
+                nn.GELU(),
+                nn.Linear(256, 1),
                 nn.Tanh()
             )
 
@@ -423,6 +451,15 @@ class BaselineCLIPScore(nn.Module):
             nn.Linear(dim * 2 + 1, dim)
         )
 
+        # 轻量适配器（Adapter）以 residual 形式细调全局特征
+        self.use_adapters = False
+        self.img_adapter = nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, dim // 2), nn.GELU(), nn.Linear(dim // 2, dim)
+        )
+        self.txt_adapter = nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, dim // 2), nn.GELU(), nn.Linear(dim // 2, dim)
+        )
+
         # Consistency Refinement Module (optional, two-stage)
         # 注意：残差学习模式下不再使用 refinement module，因为已经内置了残差机制
         if use_refinement and not use_residual_learning:
@@ -487,10 +524,26 @@ class BaselineCLIPScore(nn.Module):
             for param in self.clip.text_model.embeddings.parameters():
                 param.requires_grad = False
 
-    def forward(self, pixel_values, ids, mask):
+    def forward(self, pixel_values, ids, mask,
+                use_cross_attn_delta: bool = False,
+                cross_layers: int = 1,
+                cross_heads: int = 4,
+                cross_dim: int = 256,
+                dual_direction_cross: bool = False,
+                use_confidence_gate: bool = False,
+                use_token_quality: bool = False,
+                use_ext_interactions: bool = False,
+                use_adapters: bool = False,
+                adapter_scale: float = 0.2,
+                use_quality_gate: bool = False):
         out = self.clip(pixel_values=pixel_values, input_ids=ids, attention_mask=mask, return_dict=True)
         img_g = F.normalize(out.image_embeds, dim=-1)  # [B,dim]
         txt_g = F.normalize(out.text_embeds, dim=-1)  # [B,dim]
+
+        # 轻量适配器（可选）
+        if use_adapters:
+            img_g = F.normalize(img_g + adapter_scale * self.img_adapter(img_g), dim=-1)
+            txt_g = F.normalize(txt_g + adapter_scale * self.txt_adapter(txt_g), dim=-1)
         
         # ===== Quality 预测（残差学习模式）=====
         if self.use_residual_learning:
@@ -508,9 +561,14 @@ class BaselineCLIPScore(nn.Module):
                 weights = weights.mean(dim=-1, keepdim=True)  # [B,Np,1]
                 weights = torch.softmax(weights, dim=1)
                 pooled = (patches * weights).sum(dim=1)  # [B,dim]
-                q_delta = self.q_delta_head(pooled) * self.residual_scale_q
+                q_delta_raw = self.q_delta_head(pooled)
             else:
-                q_delta = self.q_delta_head(img_g) * self.residual_scale_q
+                q_delta_raw = self.q_delta_head(img_g)
+            if use_quality_gate:
+                q_gate = self.quality_gate(img_g)
+            else:
+                q_gate = 1.0
+            q_delta = q_gate * q_delta_raw * self.residual_scale_q
             # 最终分数 = base + delta，并 clip 到 [0, 1]
             q = torch.clamp(q_base + q_delta, 0.0, 1.0)
         else:
@@ -534,11 +592,11 @@ class BaselineCLIPScore(nn.Module):
             c_delta_mlp = self.c_delta_head(fused)  # [-1,1]
 
             # B. 轻量跨模态注意力（可选）
-            if self.use_cross_attn_delta and self.cross_in is not None:
+            if (self.use_cross_attn_delta or use_cross_attn_delta) and self.cross_in is not None:
                 seq = torch.stack([img_g, txt_g], dim=1)  # [B,2,dim]
                 seq = self.cross_in(seq)  # [B,2,cross_dim]
                 seq = self.cross_encoder(seq)  # [B,2,cross_dim]
-                if self.dual_direction_cross:
+                if (self.dual_direction_cross or dual_direction_cross):
                     cross_feat = seq.reshape(seq.size(0), -1)  # [B,2*cross_dim]
                     c_delta_cross = self.cross_delta(cross_feat)
                 else:
@@ -548,8 +606,16 @@ class BaselineCLIPScore(nn.Module):
             else:
                 c_delta_raw = c_delta_mlp
 
+            # C. 扩展交互（可选）：拼接 |img-txt| 与 img*txt 提供更丰富的交互先验
+            if use_ext_interactions:
+                inter_abs = torch.abs(img_g - txt_g)
+                inter_mul = img_g * txt_g
+                ext = torch.cat([img_g, txt_g, sim, inter_abs, inter_mul], dim=1)
+                c_delta_ext = self.ext_inter_proj(ext)
+                c_delta_raw = 0.5 * (c_delta_raw + c_delta_ext)
+
             # 置信度门控（可选）：根据融合特征输出 gate ∈ [0,1] 对残差缩放
-            if self.use_confidence_gate and self.conf_gate is not None:
+            if (self.use_confidence_gate or use_confidence_gate) and self.conf_gate is not None:
                 gate = self.conf_gate(fused)  # [B,1]
             else:
                 gate = 1.0
@@ -893,6 +959,10 @@ def main():
     parser.add_argument('--dual_direction_cross', action='store_true', help='跨模态注意力使用双向聚合')
     parser.add_argument('--use_confidence_gate', action='store_true', help='启用置信度门控残差')
     parser.add_argument('--use_token_quality', action='store_true', help='启用基于patch的质量残差输入')
+    parser.add_argument('--use_ext_interactions', action='store_true', help='一致性残差使用扩展交互特征')
+    parser.add_argument('--use_adapters', action='store_true', help='启用轻量适配器细调全局表征')
+    parser.add_argument('--adapter_scale', type=float, help='适配器残差缩放（默认0.2）')
+    parser.add_argument('--use_quality_gate', action='store_true', help='启用质量残差门控')
     
     args = parser.parse_args()
     if args.data_csv_path: cfg.data_csv_path = args.data_csv_path
@@ -949,6 +1019,10 @@ def main():
     if args.dual_direction_cross: cfg.dual_direction_cross = True
     if args.use_confidence_gate: cfg.use_confidence_gate = True
     if args.use_token_quality: cfg.use_token_quality = True
+    if args.use_ext_interactions: cfg.use_ext_interactions = True
+    if args.use_adapters: cfg.use_adapters = True
+    if args.adapter_scale is not None: cfg.adapter_scale = float(args.adapter_scale)
+    if args.use_quality_gate: cfg.use_quality_gate = True
 
     # Prepare output directory
     ensure_dir(cfg.output_dir)
