@@ -66,8 +66,9 @@ bash run_residual_training.sh
 
 # 或手动指定参数
 python baseline.py \
-    --data_csv_path /path/to/data.csv \
-    --image_base_dir /path/to/images \
+    --data_csv_path data/data.csv \
+    --image_base_dir data/ACGIQA-3K \
+    --output_dir outputs \
     --partial_freeze \
     --freeze_layers 18 \
     --epochs 20 \
@@ -129,6 +130,9 @@ python baseline.py \
 
 ```bash
 python baseline.py \
+    --data_csv_path data/data.csv \
+    --image_base_dir data/ACGIQA-3K \
+    --output_dir outputs \
     --partial_freeze \
     --freeze_layers 18 \
     --residual_scale_q 0.2 \

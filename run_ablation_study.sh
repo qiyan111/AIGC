@@ -15,6 +15,9 @@ echo "   - 模型: baseline_best.pt"
 echo ""
 
 python baseline.py \
+    --data_csv_path data/data.csv \
+    --image_base_dir data/ACGIQA-3K \
+    --output_dir outputs \
     --no_residual_learning \
     --epochs 20 \
     --batch_size 32 \
@@ -35,6 +38,9 @@ echo "   - 模型: baseline_residual_best.pt"
 echo ""
 
 python baseline.py \
+    --data_csv_path data/data.csv \
+    --image_base_dir data/ACGIQA-3K \
+    --output_dir outputs \
     --epochs 20 \
     --batch_size 32 \
     --lr 3e-5 \
@@ -54,6 +60,9 @@ echo "   - 模型: baseline_residual_partial_freeze_18L_best.pt"
 echo ""
 
 python baseline.py \
+    --data_csv_path data/data.csv \
+    --image_base_dir data/ACGIQA-3K \
+    --output_dir outputs \
     --partial_freeze \
     --freeze_layers 18 \
     --epochs 20 \
@@ -76,6 +85,9 @@ echo "   - 模型: baseline_residual_best.pt"
 echo ""
 
 python baseline.py \
+    --data_csv_path data/data.csv \
+    --image_base_dir data/ACGIQA-3K \
+    --output_dir outputs \
     --freeze_clip \
     --epochs 20 \
     --batch_size 64 \

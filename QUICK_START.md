@@ -40,8 +40,9 @@ image2.jpg,a cat sitting on a chair,3.8,4.0
 
 ```bash
 python baseline.py \
-    --data_csv_path /path/to/data.csv \
-    --image_base_dir /path/to/images \
+    --data_csv_path data/data.csv \
+    --image_base_dir data/ACGIQA-3K \
+    --output_dir outputs \
     --partial_freeze \
     --freeze_layers 18 \
     --epochs 20

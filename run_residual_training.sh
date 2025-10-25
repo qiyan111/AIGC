@@ -22,6 +22,9 @@ echo "开始训练..."
 echo ""
 
 python baseline.py \
+    --data_csv_path data/data.csv \
+    --image_base_dir data/ACGIQA-3K \
+    --output_dir outputs \
     --partial_freeze \
     --freeze_layers 18 \
     --residual_scale_q 0.2 \
@@ -29,12 +32,18 @@ python baseline.py \
     --epochs 20 \
     --batch_size 32 \
     --lr 3e-5 \
+    --scheduler cosine \
+    --warmup_ratio 0.05 \
+    --grad_accum_steps 1 \
     --w_q 0.5 \
-    --w_c 0.5
+    --w_c 0.5 \
+    --early_stopping_patience 5 \
+    --early_stopping_min_delta 0.0005 \
+    --log_csv training_log.csv
 
 echo ""
 echo "=================================="
 echo "训练完成！"
-echo "模型保存为: baseline_residual_partial_freeze_18L_best.pt"
+echo "模型保存目录: outputs/"
 echo "=================================="
 
